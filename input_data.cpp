@@ -1,7 +1,9 @@
 #include <filesystem>
 #include <nlohmann/json.hpp>
 #include "input_data.hpp"
+#include "utils.hpp"
 #include "cv_utils.hpp"
+
 
 namespace fs = std::filesystem;
 using namespace torch::indexing;
@@ -33,57 +35,80 @@ torch::Tensor Camera::getIntrinsicsMatrix(){
                           {0.0f, 0.0f, 1.0f}}, torch::kFloat32);
 }
 
-void Camera::loadImage(float downscaleFactor){
-    // Populates image and K, then updates the camera parameters
-    // Caution: this function has destructive behaviors
-    // and should be called only once
-    if (image.numel()) std::runtime_error("loadImage already called");
-    std::cout << "Loading " << filePath << std::endl;
+void Camera::loadImage(float downscaleFactor) {
+    if (image.numel()) throw std::runtime_error("loadImage already called");
 
-    cv::Mat cImg = imreadRGB(filePath);
-    
-    float rescaleF = 1.0f;
-    // If camera intrinsics don't match the image dimensions 
-    if (cImg.rows != height || cImg.cols != width){
-        rescaleF = static_cast<float>(cImg.rows) / static_cast<float>(height);
+    // 1. 直接读取时考虑缩放
+    float totalScale = 1.0f;
+    if (downscaleFactor > 1.0f) {
+        totalScale = 1.0f / downscaleFactor;
     }
+
+    // 2. 读取并缩放图像
+    cv::Mat cImg;
+    if (totalScale != 1.0f) {
+        // 先读取原图
+        cv::Mat temp = cv::imread(filePath);
+        if (temp.empty()) {
+            throw std::runtime_error("Failed to load image: " + filePath);
+        }
+        
+        // 计算目标尺寸
+        int target_width = static_cast<int>(temp.cols * totalScale);
+        int target_height = static_cast<int>(temp.rows * totalScale);
+        
+        // 缩放
+        cv::resize(temp, cImg, cv::Size(target_width, target_height), 0, 0, cv::INTER_AREA);
+        temp.release();  // 立即释放原图
+    } else {
+        cImg = cv::imread(filePath);
+        if (cImg.empty()) {
+            throw std::runtime_error("Failed to load image: " + filePath);
+        }
+    }
+
+    // 更新相机参数
+    float rescaleF = static_cast<float>(cImg.rows) / static_cast<float>(height);
     fx *= rescaleF;
     fy *= rescaleF;
     cx *= rescaleF;
     cy *= rescaleF;
 
-    if (downscaleFactor > 1.0f){
-        float scaleFactor = 1.0f / downscaleFactor;
-        cv::resize(cImg, cImg, cv::Size(), scaleFactor, scaleFactor, cv::INTER_AREA);
-        fx *= scaleFactor;
-        fy *= scaleFactor;
-        cx *= scaleFactor;
-        cy *= scaleFactor;
-    }
-
     K = getIntrinsicsMatrix();
-    cv::Rect roi;
 
-    if (hasDistortionParameters()){
-        // Undistort
+    // 3. 处理畸变校正
+    if (hasDistortionParameters()) {
         std::vector<float> distCoeffs = undistortionParameters();
         cv::Mat cK = floatNxNtensorToMat(K);
-        cv::Mat newK = cv::getOptimalNewCameraMatrix(cK, distCoeffs, cv::Size(cImg.cols, cImg.rows), 0, cv::Size(), &roi);
-
-        cv::Mat undistorted = cv::Mat::zeros(cImg.rows, cImg.cols, cImg.type());
-        cv::undistort(cImg, undistorted, cK, distCoeffs, newK);
+        cv::Rect roi;
+        cv::Mat newK = cv::getOptimalNewCameraMatrix(cK, distCoeffs, 
+            cv::Size(cImg.cols, cImg.rows), 0, cv::Size(), &roi);
         
+        // 在原地进行畸变校正
+        cv::Mat undistorted;
+        cv::undistort(cImg, undistorted, cK, distCoeffs, newK);
+        cImg.release();  // 立即释放原图
+        
+        // 转换为tensor
         image = imageToTensor(undistorted);
+        undistorted.release();
         K = floatNxNMatToTensor(newK);
-    }else{
-        roi = cv::Rect(0, 0, cImg.cols, cImg.rows);
+        
+        // 如果需要裁剪ROI
+        if (roi.x != 0 || roi.y != 0 || 
+            roi.width != image.size(1) || roi.height != image.size(0)) {
+            image = image.index({
+                Slice(roi.y, roi.y + roi.height), 
+                Slice(roi.x, roi.x + roi.width), 
+                Slice()
+            }).clone();  // 确保内存连续
+        }
+    } else {
         image = imageToTensor(cImg);
+        cImg.release();
     }
 
-    // Crop to ROI
-    image = image.index({Slice(roi.y, roi.y + roi.height), Slice(roi.x, roi.x + roi.width), Slice()});
-
-    // Update parameters
+    // 更新最终参数
     height = image.size(0);
     width = image.size(1);
     fx = K[0][0].item<float>();
@@ -91,6 +116,8 @@ void Camera::loadImage(float downscaleFactor){
     cx = K[0][2].item<float>();
     cy = K[1][2].item<float>();
 }
+
+
 
 torch::Tensor Camera::getImage(int downscaleFactor){
     if (downscaleFactor <= 1) return image;
@@ -193,4 +220,40 @@ void InputData::saveCameras(const std::string &filename, bool keepCrs){
     of.close();
 
     std::cout << "Wrote " << filename << std::endl;
+}
+
+// 实现构造函数
+OptimizedImageLoader::OptimizedImageLoader(size_t maxMemoryMB) 
+    : maxMemoryBytes(maxMemoryMB * 1024 * 1024) {}
+
+// 实现loadImages方法
+void OptimizedImageLoader::loadImages(std::vector<Camera>& cameras, float downscaleFactor) {
+    if (cameras.empty()) return;
+
+    size_t estimatedMemPerImage = estimateImageMemory(cameras[0]);
+    size_t batchSize = std::max(
+        size_t(1),
+        maxMemoryBytes / (estimatedMemPerImage * 3)
+    );
+
+    for(size_t i = 0; i < cameras.size(); i += batchSize) {
+        size_t currentBatch = std::min(batchSize, cameras.size() - i);
+        
+        parallel_for(
+            cameras.begin() + i,
+            cameras.begin() + i + currentBatch,
+            [&downscaleFactor](Camera &cam){
+                cam.loadImage(downscaleFactor);
+            }
+        );
+
+        std::cout << "Processed " << std::min(i + batchSize, cameras.size()) 
+                 << "/" << cameras.size() << " images\r" << std::flush;
+    }
+    std::cout << std::endl;
+}
+
+// 实现estimateImageMemory方法
+size_t OptimizedImageLoader::estimateImageMemory(const Camera& camera) {
+    return camera.width * camera.height * 3 * sizeof(float);
 }

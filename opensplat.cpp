@@ -115,9 +115,13 @@ int main(int argc, char *argv[]){
 
         InputData inputData = inputDataFromX(projectRoot);
 
-        parallel_for(inputData.cameras.begin(), inputData.cameras.end(), [&downScaleFactor](Camera &cam){
-            cam.loadImage(downScaleFactor);
-        });
+
+        OptimizedImageLoader loader(1024*4); // 限制使用1GB内存
+        loader.loadImages(inputData.cameras, downScaleFactor);
+
+        // parallel_for(inputData.cameras.begin(), inputData.cameras.end(), [&downScaleFactor](Camera &cam){
+        //     cam.loadImage(downScaleFactor);
+        // });
 
         // Withhold a validation camera if necessary
         auto t = inputData.getCameras(validate, valImage);

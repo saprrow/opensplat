@@ -61,4 +61,14 @@ struct InputData{
 };
 InputData inputDataFromX(const std::string &projectRoot);
 
+class OptimizedImageLoader {
+public:
+    OptimizedImageLoader(size_t maxMemoryMB = 2048);
+    void loadImages(std::vector<Camera>& cameras, float downscaleFactor);
+
+private:
+    size_t maxMemoryBytes;
+    size_t estimateImageMemory(const Camera& camera);
+};
+
 #endif
